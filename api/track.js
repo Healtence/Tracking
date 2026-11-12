@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Healtence order tracking — Shopify App Proxy endpoint (Vercel Node.js function)
  *
  * Storefront request:  https://healtence.com/apps/track?tracking_number=LP00123456789
@@ -9,20 +9,28 @@
  *   SHOPIFY_APP_SECRET   (required) the app's Client secret. Used to verify the proxy signature.
  *   SHOPIFY_SHOP_DOMAIN  (optional) e.g. healtence.myshopify.com. Rejects requests signed for any other shop.
  *   HIDE_ORIGIN_COUNTRY  (optional) "true" to leave the origin country out of responses.
+ *
+ * Response contract (always JSON):
+ *   { ok: true,  trackingNumber, status, estimatedDelivery, origin, destination, carriers, events, fetchedAt, cached, stale? }
+ *   { ok: false, error: { code, message }, trackingNumber? }
+ *
+ * Business errors (bad number, not found, carrier down) are returned with HTTP 200 and ok:false so
+ * Shopify's proxy always passes the JSON body through. Only a failed signature returns 401.
  */
 import crypto from 'node:crypto';
 
+// ───────────────────────── Config ─────────────────────────
 const CAINIAO_ENDPOINT = 'https://global.cainiao.com/detail.json';
 const UPSTREAM_TIMEOUT_MS = 8000;
-const SIGNATURE_MAX_AGE_SEC = 300;
-const UPSTREAM_MAX_PER_MINUTE = 40;
+const SIGNATURE_MAX_AGE_SEC = 300; // reject signed URLs older than 5 minutes (replay protection)
+const UPSTREAM_MAX_PER_MINUTE = 40; // per warm instance; protects Cainiao from bursts
 const CACHE_MAX_ENTRIES = 500;
 const CACHE_TTL_MS = {
-  delivered: 6 * 60 * 60 * 1000,
+  delivered: 6 * 60 * 60 * 1000, // finished shipments rarely change
   active: 20 * 60 * 1000,
   notFound: 5 * 60 * 1000,
 };
-const STALE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const STALE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // serve last known data if Cainiao is down
 const MAX_EVENTS = 150;
 const TRACKING_RE = /^[A-Z0-9]{8,40}$/;
 
@@ -53,6 +61,8 @@ const ERROR_MESSAGES = {
   UPSTREAM_ERROR: 'Tracking is temporarily unavailable. Try again in a few minutes.',
 };
 
+// Field-name candidates for Cainiao's undocumented JSON. If Cainiao renames a field,
+// add the new name here — the rest of the parser does not need to change.
 const FIELDS = {
   eventTime: ['time', 'eventTime', 'timestamp', 'gmtCreate', 'opTime'],
   eventTimeLocal: ['timeStr', 'eventTimeStr', 'localTime'],
@@ -71,8 +81,9 @@ const FIELDS = {
   etaMax: ['deliveryMaxTime', 'maxDeliveryTime', 'etaMaxTime', 'endTime'],
 };
 
-const cache = new Map();
-const inFlight = new Map();
+// ───────────── Module state (lives while this function instance is warm) ─────────────
+const cache = new Map(); // trackingNumber -> { value, storedAt, expiresAt }
+const inFlight = new Map(); // trackingNumber -> Promise (dedupes concurrent lookups)
 const upstreamWindow = { start: 0, count: 0 };
 
 class TrackingError extends Error {
@@ -82,6 +93,7 @@ class TrackingError extends Error {
   }
 }
 
+// ───────────────────────── Handler ─────────────────────────
 export default async function handler(req, res) {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.setHeader('Allow', 'GET, HEAD');
@@ -119,6 +131,14 @@ export default async function handler(req, res) {
   }
 }
 
+// ───────────────────────── Shopify App Proxy signature ─────────────────────────
+/**
+ * Shopify signs App Proxy requests with a `signature` query param:
+ *   1. remove `signature`
+ *   2. for each key: "key=value" (repeated keys: values joined with ",")
+ *   3. sort those strings, concatenate with no separator
+ *   4. HMAC-SHA256 hex digest with the app's Client secret
+ */
 export function verifyAppProxySignature(params, secret) {
   const signature = params.get('signature') || '';
   if (!/^[a-f0-9]{64}$/i.test(signature)) return { ok: false, reason: 'missing or malformed signature' };
@@ -152,6 +172,7 @@ export function verifyAppProxySignature(params, secret) {
   return { ok: true };
 }
 
+// ───────────────────────── Lookup, dedupe, rate limit ─────────────────────────
 function lookupDeduped(trackingNumber) {
   const pending = inFlight.get(trackingNumber);
   if (pending) return pending;
@@ -182,6 +203,7 @@ function takeUpstreamSlot() {
   return true;
 }
 
+// ───────────────────────── Cache ─────────────────────────
 function cacheSet(key, value) {
   const ttl = !value.ok
     ? CACHE_TTL_MS.notFound
@@ -189,7 +211,7 @@ function cacheSet(key, value) {
       ? CACHE_TTL_MS.delivered
       : CACHE_TTL_MS.active;
   const now = Date.now();
-  cache.delete(key);
+  cache.delete(key); // re-insert so Map order works as LRU
   cache.set(key, { value, storedAt: now, expiresAt: now + ttl });
   while (cache.size > CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value);
 }
@@ -206,6 +228,7 @@ function cacheGet(key, { allowStale = false } = {}) {
   return allowStale ? entry.value : null;
 }
 
+// ───────────────────────── Cainiao request ─────────────────────────
 async function fetchCainiao(trackingNumber) {
   const url = new URL(CAINIAO_ENDPOINT);
   url.searchParams.set('mailNos', trackingNumber);
@@ -228,7 +251,7 @@ async function fetchCainiao(trackingNumber) {
       },
       signal: controller.signal,
     });
-    body = await response.text();
+    body = await response.text(); // read inside the timeout so a slow body also aborts
   } catch (err) {
     throw new TrackingError(err.name === 'AbortError' ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_ERROR', err.message);
   } finally {
@@ -258,6 +281,7 @@ function looksBlocked(text) {
   return /rgv587_flag|x5secdata|punish|captcha|slide to verify|_____tmd_____/i.test(text || '');
 }
 
+// ───────────────────────── Parser ─────────────────────────
 export function parseCainiao(json, trackingNumber) {
   const modules = toArray(json.module ?? json.data?.module ?? json.data).filter(isObject);
   const mod = modules.find((m) => normalizeTrackingNumber(m.mailNo) === trackingNumber) || modules[0];
@@ -324,10 +348,11 @@ function extractEvents(mod) {
     events.push(event);
   }
 
-  events.sort((a, b) => b.sortKey - a.sortKey);
+  events.sort((a, b) => b.sortKey - a.sortKey); // newest first
   return events.slice(0, MAX_EVENTS).map(({ sortKey, ...event }) => event);
 }
 
+/** Walks the module and collects every array whose items look like tracking events. */
 function collectEventArrays(node, out, depth, visited) {
   if (depth > 6 || !node || typeof node !== 'object' || visited.has(node)) return;
   visited.add(node);
@@ -355,6 +380,7 @@ function normalizeEvent(e) {
   if (!description) return null;
 
   let location = cleanText(pick(e, FIELDS.eventLocation));
+  // Many carriers prefix the location: "[Los Angeles, CA] Arrived at facility" or "【深圳】..."
   const bracket = description.match(/^\s*[[【]([^\]】]{2,80})[\]】]\s*(.+)$/s);
   if (bracket) {
     if (!location) location = bracket[1].trim();
@@ -374,8 +400,8 @@ function normalizeEvent(e) {
 
   return {
     timestamp: ms != null ? new Date(ms).toISOString() : (local?.timestampMs != null ? new Date(local.timestampMs).toISOString() : null),
-    date: local?.date ?? null,
-    time: local?.time ?? null,
+    date: local?.date ?? null, // date in the event's local time zone, YYYY-MM-DD
+    time: local?.time ?? null, // HH:mm in the event's local time zone
     timeZone,
     location: location || null,
     description,
@@ -408,6 +434,11 @@ function carrierFrom(info, extra = {}) {
   };
 }
 
+/**
+ * Maps carrier text or status codes to one of:
+ * info_received | in_transit | out_for_delivery | pickup | delivered | exception | not_found | unknown
+ * Order matters: more specific states are checked before generic ones.
+ */
 export function classify(input) {
   if (!input) return 'unknown';
   const s = String(input).toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
@@ -433,6 +464,7 @@ export function classify(input) {
   return 'unknown';
 }
 
+// ───────────────────────── Small helpers ─────────────────────────
 function pick(obj, keys, { allowNumbers = false } = {}) {
   if (!isObject(obj)) return null;
   for (const key of keys) {
@@ -449,9 +481,10 @@ function toMs(value) {
   if (typeof value === 'number' || /^\d{9,13}$/.test(str)) {
     let n = Number(str);
     if (!Number.isFinite(n) || n <= 0) return null;
-    if (n < 1e11) n *= 1000;
-    return n > 1.4e12 && n < 4.1e12 ? n : null;
+    if (n < 1e11) n *= 1000; // seconds -> ms
+    return n > 1.4e12 && n < 4.1e12 ? n : null; // sanity range: 2014–2099
   }
+  // Only trust strings that carry an explicit time zone (ISO with Z or offset)
   if (/^\d{4}-\d{2}-\d{2}T.*(Z|[+-]\d{2}:?\d{2})$/.test(str)) {
     const parsed = Date.parse(str);
     return Number.isNaN(parsed) ? null : parsed;
@@ -490,7 +523,11 @@ function parseLocalDateTime(value, timeZoneHint) {
 
   const finalOffsetMinutes = offsetMinutes ?? 0;
   const timestampMs = utcMs - finalOffsetMinutes * 60_000;
-  return { date, time, timestampMs };
+  return {
+    date,
+    time,
+    timestampMs,
+  };
 }
 
 function parseTimeZoneOffset(timeZoneHint, sign, tzHour, tzMinute) {
@@ -555,7 +592,9 @@ function failure(code, extra = {}) {
 function send(res, status, body) {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  // Every proxied URL carries a unique timestamp + signature, so CDN caching cannot help here.
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.end(JSON.stringify(body));
 }
+D
